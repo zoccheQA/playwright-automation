@@ -1,27 +1,107 @@
 name: Playwright Tests
+
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+
 jobs:
   test:
     timeout-minutes: 60
     runs-on: ubuntu-latest
+
+    env:
+      SPRINT: sprint5
+      DISABLE_LOGGING: "true"
+      BASE_URL: http://localhost:4200
+
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
-      with:
-        node-version: lts/*
-    - name: Install dependencies
-      run: npm ci
-    - name: Install Playwright Browsers
-      run: npx playwright install --with-deps
-    - name: Run Playwright tests
-      run: npx playwright test
-    - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
-      with:
-        name: playwright-report
-        path: playwright-report/
-        retention-days: 30
+      # 1. Baixa o código deste projeto (os testes)
+      - name: Checkout test project
+        uses: actions/checkout@v4
+
+      # 2. Baixa o código da aplicação Toolshop para a pasta "toolshop"
+      - name: Checkout Toolshop application
+        uses: actions/checkout@v4
+        with:
+          repository: testsmith-io/practice-software-testing
+          path: toolshop
+
+      # 3. Sobe os containers (API, front-end, banco e servidor web)
+      - name: Start Toolshop containers
+        working-directory: toolshop
+        run: docker compose -f docker-compose.yml up -d --force-recreate
+
+      - name: Wait for containers to start
+        run: sleep 30s
+
+      # 4. Instala as bibliotecas PHP da API
+      - name: Install API dependencies
+        working-directory: toolshop
+        run: docker compose exec -T -u root laravel-api composer install --no-dev --optimize-autoloader --ignore-platform-req=ext-ffi
+
+      # 5. Espera o banco de dados ficar pronto
+      - name: Wait for database
+        working-directory: toolshop
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T mariadb mysqladmin ping -h localhost -u root -proot --silent 2>/dev/null; then
+              echo "Database is ready!"
+              exit 0
+            fi
+            echo "Attempt $i/30 - database not ready yet..."
+            sleep 2
+          done
+          echo "Database did not start in time"
+          exit 1
+
+      # 6. Cria as tabelas e insere os dados iniciais
+      - name: Create and seed database
+        working-directory: toolshop
+        run: docker compose exec -T laravel-api php artisan migrate:refresh --seed
+
+      # 7. Espera o front-end Angular compilar
+      - name: Wait for Toolshop UI
+        working-directory: toolshop
+        run: |
+          for i in $(seq 1 120); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:4200 | grep -q "200"; then
+              echo "Toolshop UI is ready!"
+              exit 0
+            fi
+            echo "Attempt $i/120 - UI not ready yet..."
+            sleep 5
+          done
+          echo "Toolshop UI did not start in time"
+          docker compose logs angular-ui
+          exit 1
+
+      # 8. Prepara o Node e instala as dependências dos testes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      # 9. Roda os testes contra o Toolshop local (BASE_URL acima)
+      - name: Run Playwright tests
+        run: npx playwright test
+
+      # 10. Se algo falhar, mostra os logs da aplicação
+      - name: Show Toolshop logs on failure
+        if: failure()
+        working-directory: toolshop
+        run: docker compose logs --tail=100
+
+      # 11. Guarda o relatório HTML como artefato
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 30
